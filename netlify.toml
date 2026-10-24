@@ -1,0 +1,13 @@
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
+
+# Custom domain setup:
+# 1. In Netlify: Site settings -> Domain management -> Add a domain, e.g. ehr.molepololeclinics.bw
+# 2. Add the DNS records Netlify shows you at your domain registrar (usually a CNAME or ALIAS record).
+# 3. Netlify issues a free HTTPS certificate automatically once DNS resolves.

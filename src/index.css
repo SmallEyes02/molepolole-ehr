@@ -1,0 +1,45 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body, #root { height: 100%; }
+
+body {
+  @apply bg-bg text-ink font-sans antialiased;
+}
+
+* { -webkit-tap-highlight-color: transparent; }
+
+::selection { background: #0E7C7B33; }
+
+/* keyboard focus visibility */
+a:focus-visible, button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible {
+  outline: 2px solid #0E7C7B;
+  outline-offset: 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  * { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }
+}
+
+table { border-collapse: collapse; width: 100%; }
+
+.input {
+  @apply w-full rounded-sm border border-border bg-white px-3 py-2 text-sm text-ink placeholder:text-slate-400;
+}
+
+.label {
+  @apply mb-1 block text-sm font-medium text-ink/80;
+}
+
+.btn-primary {
+  @apply inline-flex items-center justify-center gap-2 rounded-sm bg-ink px-4 py-2 text-sm font-medium text-white hover:bg-ink/90 disabled:opacity-50;
+}
+
+.btn-secondary {
+  @apply inline-flex items-center justify-center gap-2 rounded-sm border border-border bg-white px-4 py-2 text-sm font-medium text-ink hover:bg-bg;
+}
+
+.card {
+  @apply rounded-sm border border-border bg-white;
+}
