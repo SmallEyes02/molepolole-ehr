@@ -5,23 +5,57 @@
 // administrator can only act on staff at their own facility.
 //
 // Deploy: Supabase dashboard -> Edge Functions -> Deploy a new function
-// named "manage-staff", paste this file, keep "Verify JWT" ON.
-// SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY are provided automatically.
+// named exactly "manage-staff" and paste this file.
+// Turn "Verify JWT" OFF: browsers send the CORS preflight (OPTIONS)
+// without a token, and the gateway would reject it with a 401. This is
+// safe because the code below verifies the caller itself on every real
+// request and refuses anyone who is not an active administrator.
+// CLI: supabase functions deploy manage-staff --no-verify-jwt
+// SUPABASE_URL and the secret key are provided automatically.
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
 
-const cors = {
+const baseCors = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type'
+  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+  'Access-Control-Max-Age': '86400'
 }
 
-const json = (body: unknown, status = 200) =>
-  new Response(JSON.stringify(body), { status, headers: { ...cors, 'Content-Type': 'application/json' } })
+// Echo back whatever headers the browser asks to send, so a newer
+// supabase-js adding a header can never break the preflight check.
+function corsFor(req: Request) {
+  return {
+    ...baseCors,
+    'Access-Control-Allow-Headers':
+      req.headers.get('Access-Control-Request-Headers') ?? 'authorization, x-client-info, apikey, content-type'
+  }
+}
+
+// Projects on Supabase's newer API keys may supply the secret key as
+// SUPABASE_SECRET_KEYS (a JSON object, usually {"default": "sb_secret_..."})
+// instead of SUPABASE_SERVICE_ROLE_KEY. SERVICE_KEY is an optional secret
+// you can set yourself (Edge Functions, Secrets) to override both.
+function secretKey(): string {
+  const own = Deno.env.get('SERVICE_KEY')
+  if (own) return own
+  const multi = Deno.env.get('SUPABASE_SECRET_KEYS')
+  if (multi) {
+    try {
+      const parsed = JSON.parse(multi)
+      const found = parsed.default ?? Object.values(parsed)[0]
+      if (found) return String(found)
+    } catch { /* fall through to the legacy variable */ }
+  }
+  return Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
+}
 
 Deno.serve(async (req) => {
-  if (req.method === 'OPTIONS') return new Response('ok', { headers: cors })
+  const cors = corsFor(req)
+  if (req.method === 'OPTIONS') return new Response(null, { status: 204, headers: cors })
+  const json = (body: unknown, status = 200) =>
+    new Response(JSON.stringify(body), { status, headers: { ...cors, 'Content-Type': 'application/json' } })
 
   try {
-    const admin = createClient(Deno.env.get('SUPABASE_URL')!, Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!)
+    const admin = createClient(Deno.env.get('SUPABASE_URL')!, secretKey())
 
     // 1. who is calling?
     const token = (req.headers.get('Authorization') ?? '').replace('Bearer ', '')
@@ -38,7 +72,12 @@ Deno.serve(async (req) => {
       return json({ error: 'Administrator access is required.' }, 403)
     }
 
-    const body = await req.json()
+    let body: Record<string, unknown>
+    try {
+      body = await req.json()
+    } catch {
+      return json({ error: 'The request body must be valid JSON.' }, 400)
+    }
 
     // ---- create a staff login + staff record ----
     if (body.action === 'create') {
@@ -51,7 +90,7 @@ Deno.serve(async (req) => {
       if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return json({ error: 'Enter a valid email address.' }, 400)
       if (password.length < 8) return json({ error: 'The password must be at least 8 characters.' }, 400)
       if (!firstName || !lastName) return json({ error: 'First and last name are required.' }, 400)
-      if (![1, 2, 3, 4, 5].includes(roleId)) return json({ error: 'Choose a valid role.' }, 400)
+      if (![1, 2, 3, 4, 5, 6].includes(roleId)) return json({ error: 'Choose a valid role.' }, 400)
 
       if (body.department_id) {
         const { data: dept } = await admin

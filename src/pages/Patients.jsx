@@ -21,12 +21,13 @@ export default function Patients() {
     setLoading(true)
     let request = supabase
       .from('patients')
-      .select('id, first_name, last_name, date_of_birth, sex, omang_number, phone, villages(name)')
+      .select('id, card_number, first_name, last_name, date_of_birth, sex, omang_number, phone, villages(name)')
       .order('created_at', { ascending: false })
       .limit(50)
 
-    if (query.trim()) {
-      request = request.or(`first_name.ilike.%${query}%,last_name.ilike.%${query}%,omang_number.ilike.%${query}%`)
+    const q = query.trim().replace(/[,()]/g, ' ')
+    if (q) {
+      request = request.or(`first_name.ilike.%${q}%,last_name.ilike.%${q}%,omang_number.ilike.%${q}%,card_number.ilike.%${q}%`)
     }
 
     const { data, error } = await request
@@ -53,7 +54,7 @@ export default function Patients() {
             <Search size={16} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-ink/40" />
             <input
               className="input pl-9"
-              placeholder="Search by name or Omang number"
+              placeholder="Search by name, Omang or card number"
               value={query}
               onChange={(e) => setQuery(e.target.value)}
             />
@@ -64,6 +65,7 @@ export default function Patients() {
           <table>
             <thead>
               <tr className="text-left text-xs uppercase tracking-wide text-ink/40">
+                <th className="px-4 py-2 font-medium">Card no.</th>
                 <th className="px-4 py-2 font-medium">Name</th>
                 <th className="px-4 py-2 font-medium">Omang number</th>
                 <th className="px-4 py-2 font-medium">Sex</th>
@@ -75,13 +77,14 @@ export default function Patients() {
             <tbody>
               {!loading && patients.length === 0 && (
                 <tr>
-                  <td colSpan={6} className="px-4 py-6 text-center text-sm text-ink/40">
+                  <td colSpan={7} className="px-4 py-6 text-center text-sm text-ink/40">
                     No patients found.
                   </td>
                 </tr>
               )}
               {patients.map((p) => (
                 <tr key={p.id} className="border-t border-border text-sm hover:bg-bg">
+                  <td className="px-4 py-2 font-mono text-xs text-ink/70">{p.card_number}</td>
                   <td className="px-4 py-2">
                     <Link to={`/patients/${p.id}`} className="font-medium text-accent hover:underline">
                       {p.first_name} {p.last_name}

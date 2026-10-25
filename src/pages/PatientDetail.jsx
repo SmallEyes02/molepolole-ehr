@@ -4,7 +4,9 @@ import { Stethoscope, Phone, User, ArrowLeftRight, Pencil } from 'lucide-react'
 import { supabase } from '../lib/supabaseClient'
 import { useAuth } from '../context/AuthContext'
 import { can } from '../lib/permissions'
+import { medicineStatus } from '../lib/portal'
 import PageHeader from '../components/PageHeader'
+import PortalAccessCard from '../components/PortalAccessCard'
 
 export default function PatientDetail() {
   const { patientId } = useParams()
@@ -29,7 +31,7 @@ export default function PatientDetail() {
         .order('visit_date', { ascending: false }),
       supabase
         .from('prescriptions')
-        .select('id, dosage, frequency, duration_days, instructions, created_at, medications(name, form, strength), visits!inner(patient_id)')
+        .select('id, dosage, frequency, duration_days, instructions, created_at, medications(name, form, strength), dispensings(is_partial, reversed_at, dispensed_at), visits!inner(patient_id)')
         .eq('visits.patient_id', patientId)
         .order('created_at', { ascending: false })
         .limit(20)
@@ -49,7 +51,7 @@ export default function PatientDetail() {
     <div>
       <PageHeader
         title={`${patient.first_name} ${patient.last_name}`}
-        subtitle={`${age} years old · ${patient.sex === 'M' ? 'Male' : 'Female'}${patient.omang_number ? ' · Omang ' + patient.omang_number : ''}`}
+        subtitle={`Card ${patient.card_number} · ${age} years old · ${patient.sex === 'M' ? 'Male' : 'Female'}${patient.omang_number ? ' · Omang ' + patient.omang_number : ''}`}
         action={
           <div className="flex gap-2">
             {can(profile, 'patients.update') && (
@@ -75,7 +77,8 @@ export default function PatientDetail() {
       />
 
       <div className="grid grid-cols-1 gap-4 p-6 lg:grid-cols-3">
-        <div className="card p-4 lg:col-span-1">
+        <div className="space-y-4 lg:col-span-1">
+        <div className="card p-4">
           <h2 className="mb-3 text-sm font-semibold text-ink">Patient details</h2>
           <dl className="space-y-2 text-sm">
             <Row icon={Phone} label="Phone" value={patient.phone} />
@@ -84,6 +87,8 @@ export default function PatientDetail() {
             <Row label="Village" value={patient.villages?.name} />
             <Row label="Date of birth" value={new Date(patient.date_of_birth).toLocaleDateString('en-GB')} />
           </dl>
+        </div>
+        {can(profile, 'portal.manage') && <PortalAccessCard patientId={patientId} />}
         </div>
 
         <div className="card lg:col-span-2">
@@ -144,12 +149,13 @@ export default function PatientDetail() {
                 <th className="px-4 py-2 font-medium">Frequency</th>
                 <th className="px-4 py-2 font-medium">Duration</th>
                 <th className="px-4 py-2 font-medium">Instructions</th>
+                <th className="px-4 py-2 font-medium">Pharmacy</th>
               </tr>
             </thead>
             <tbody>
               {prescriptions.length === 0 && (
                 <tr>
-                  <td colSpan={6} className="px-4 py-6 text-center text-sm text-ink/40">
+                  <td colSpan={7} className="px-4 py-6 text-center text-sm text-ink/40">
                     No prescriptions recorded for this patient yet.
                   </td>
                 </tr>
@@ -165,6 +171,7 @@ export default function PatientDetail() {
                   <td className="px-4 py-2 text-ink/70">{rx.frequency}</td>
                   <td className="px-4 py-2 text-ink/70">{rx.duration_days ? `${rx.duration_days} days` : '—'}</td>
                   <td className="px-4 py-2 text-ink/70">{rx.instructions || '—'}</td>
+                  <td className="px-4 py-2 text-ink/70">{medicineStatus(rx.dispensings).label.replace('Waiting at the pharmacy', 'Not yet dispensed').replace(', the rest is owed', ', balance owed')}</td>
                 </tr>
               ))}
             </tbody>

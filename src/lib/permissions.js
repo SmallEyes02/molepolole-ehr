@@ -12,7 +12,8 @@ export const ROLES = {
   DOCTOR: 2,
   NURSE: 3,
   CLINICIAN: 4,
-  RECORDS_OFFICER: 5
+  RECORDS_OFFICER: 5,
+  PHARMACIST: 6
 }
 
 export function isAdministrator(roleId) {

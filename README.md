@@ -113,27 +113,113 @@ Security problems found and fixed while building this:
 2. The audit log could be read by every staff member through the API.
 3. `is_active` was never checked, so deactivated accounts kept full access.
 
-### Creating staff accounts (Edge Function)
+### Creating staff accounts
 
-Creating a login needs Supabase's admin API, which must never be exposed in the browser, so it runs in an Edge Function.
+There are two ways to add a staff member. Both are on **Staff**, **Add staff member**.
 
+**Option 1: Link an existing login (no deployment needed).**
+1. In the Supabase dashboard, open Authentication, Users, Add user. Enter an email and password and tick **Auto Confirm User**.
+2. In the app, choose **Link an existing login**, enter the same email, a name, a role and a department.
+
+This needs `0011_link_staff_account.sql` (included in `schema_full.sql`). Resetting a password for these accounts is done in the Supabase dashboard (Authentication, Users).
+
+**Option 2: Create the login from inside the app (Edge Function).** Creating a login needs Supabase's admin API, which must never be exposed in a browser, so it runs in a small server-side function that first checks the caller is an active administrator.
 1. Supabase dashboard, **Edge Functions**, **Deploy a new function**, name it exactly `manage-staff`.
-2. Paste in `supabase/functions/manage-staff/index.ts` and deploy. Leave **Verify JWT** on. No secrets need to be set.
-3. Sign in as an administrator, open **Staff**, **Add staff member**.
+2. Paste in `supabase/functions/manage-staff/index.ts`.
+3. Turn **Verify JWT OFF**. Browsers send a CORS preflight without a token and the gateway would reject it. This is safe because the function verifies the caller itself on every request.
+4. Deploy. (CLI: `supabase functions deploy manage-staff --no-verify-jwt`.) No secrets need to be set.
 
-Until the function is deployed, the Add and Password buttons will show an error. You can still create a login under Authentication, Users and attach it with the `insert into staff` SQL from the setup section.
+**If you see "blocked by CORS policy ... does not have HTTP ok status"**, the browser's preflight got a non-success reply, so the function never ran. Find out which with this (Windows PowerShell; keep `curl.exe`):
+
+```
+curl.exe -i -X OPTIONS https://YOUR-PROJECT-REF.supabase.co/functions/v1/manage-staff -H "Origin: http://localhost:5173" -H "Access-Control-Request-Method: POST"
+```
+
+- `404`: not deployed, or the name is not exactly `manage-staff`.
+- `401`: Verify JWT is on. Turn it off and redeploy.
+- `500` or `503`: the function crashed on start. Open Edge Functions, `manage-staff`, Logs.
+- `204`: the function is fine and the problem is elsewhere.
+
+**If the response body says `INVALID_API_KEY` ... "apikey looks like a legacy JWT-based key"**, your `.env` still holds the old `anon` key (the long `eyJ...` one) but the project uses Supabase's new API keys. In Project Settings, API Keys, copy the **Publishable key** (`sb_publishable_...`), put it in `.env` as `VITE_SUPABASE_ANON_KEY`, and restart `npm run dev`. Never use the secret key in the browser.
+
+**If the Staff page says "Edge Function returned a non-2xx status code"** (or now, a more specific message), the request reached Supabase but was refused. The most common cause is **Verify JWT** being on: projects that use Supabase's newer signing keys fail the gateway's check even for a signed-in admin, and the response is a 401 that never reaches the function. Turn Verify JWT off and redeploy. To see the exact response yourself, open the browser's developer tools (F12), Network tab, click the `manage-staff` request, then Response. The function's own errors are always `{"error": "..."}`; anything else came from the platform.
 
 ### Upgrading a project that already runs an earlier version
 
-Run `supabase/migrations/0010_admin_module.sql` in the SQL editor. It is safe to run more than once. A fresh project only needs `schema_full.sql`, which already includes it.
+Run `supabase/migrations/0010_admin_module.sql`, then `0011_link_staff_account.sql`, then `0012_patient_portal.sql`, then `0013_digital_card.sql`, then `0014_pharmacy.sql`, in the SQL editor. All are safe to run more than once. A fresh project only needs `schema_full.sql`, which already includes it.
 
 After a permission change, users see updated menus the next time they sign in. The database enforces the change immediately.
 
 ### Not covered
 
 - Working hours are shown and used as a default but not enforced when booking.
-- Dispensing a prescription does not reduce stock automatically; stock changes are recorded on the Inventory page.
 - Bills are entered by the administrator; there are no insurance claims, taxes or printed receipts.
+
+## Patient portal (the digital health card)
+
+The portal replaces the paper clinic card. A patient signs in once and can then open their card at any time, from any phone or computer: **their health card** (name, card number, date of birth, Omang, clinic), **appointments**, **medical history** (visits, measurements, diagnoses, medicines) and **notifications**. It is read-only, and **access never expires**.
+
+**Card number.** Every patient has a permanent card number such as `MP000123`, like the number on a paper card. It is fixed once issued, unique, and searchable by staff. It identifies a record but is not a secret: it does not give anyone access on its own.
+
+**How a patient gets access** (a name or Omang number alone is never enough):
+1. At the front desk, staff with the `portal.manage` permission (Administrator and Records Officer by default) confirm the patient's identity, open their record, and choose **Patient portal, Generate activation code**.
+2. They give the patient the code (for example `K7QM-4XWP`). It is shown once and stored only as a hash. **It does not expire.** It works once, and is replaced if a new one is generated or can be cancelled by staff.
+3. The patient opens `/register`, creates a login (email and password), and enters the code once. After that they just sign in.
+4. Wrong guesses are limited: 5 failed attempts locks that login's claiming for 15 minutes. A login without a code sees nothing at all.
+5. Staff can remove a patient's access from the same card (for example after a lost phone).
+
+**Staying signed in.** The app keeps patients signed in on their device and refreshes the session automatically. In the Supabase dashboard, under Authentication, Sessions, leave **Time-box user sessions** and **Inactivity timeout** switched **off** (or at zero); those settings sign people out and would defeat this.
+
+**Never locked out.** On the sign-in page, **Forgot your password?** emails a reset link. Two things are needed in Supabase: under Authentication, URL Configuration, add your site address (and `http://localhost:5173`) to **Redirect URLs**; and be aware the built-in email sender is heavily rate-limited, so before real use set up your own email service (Authentication, SMTP settings).
+
+**Quick access.** The app has a home-screen icon and manifest, so on a phone the patient can choose **Add to Home Screen** and open their card in one tap. (This is a shortcut: it still needs a connection.)
+
+**Notifications** (shown in the portal):
+- Booked, moved or cancelled appointments notify the patient.
+- A reminder appears when an appointment is within **Reminder (hours before)** hours (Settings, default 24). Reminders are created when the patient opens the portal, so no scheduled job is needed, and each appointment time is only ever reminded once. Reminders for moved or cancelled appointments are hidden.
+
+**Supabase settings to check:** Authentication, Sign In / Providers, **Allow new users to sign up** must be on or patients cannot create a login. If **Confirm email** is on (recommended), patients confirm their email first, then sign in and enter their code.
+
+**Upgrading:** run `supabase/migrations/0012_patient_portal.sql`, then `0013_digital_card.sql` (both safe to run more than once). A fresh project only needs `schema_full.sql`. Codes issued before 0013 keep the 7-day expiry they were given; new ones never expire.
+
+**Security, and what comes later.** Patients are read-only and limited to their own rows by the database, not by the app. They cannot see staff, other patients, bills, stock, settings, the audit log, or the base appointments table. For now, anyone who can sign in to a patient's account can see that patient's records, which is what makes the card easy to use but also means a signed-in phone is as sensitive as a paper card in someone's pocket. Staff can remove access immediately if a phone is lost. Stronger proof that the owner is the one opening it (for example fingerprint or face unlock) is planned for production and can be added to the sign-in step without changing the records or permissions.
+
+### Not covered yet
+
+- **Texts and emails are not sent.** A patient sees notifications after signing in. Sending an SMS or email needs a provider account and its key; the reminder records already exist, so it is a small addition once you choose.
+- **No offline use.** The card needs a connection to open. Working with no signal would need the app to cache itself and the last-viewed record on the phone, which has its own privacy trade-offs on shared phones.
+- Patients cannot book, reschedule or cancel online.
+- Laboratory results and allergies are not shown (those features are not built yet).
+
+## Pharmacy (dispensing)
+
+A **Pharmacist** role and a **Pharmacy** screen let medicines be handed to patients, with stock kept up to date automatically.
+
+**Setting it up**
+1. Run `supabase/migrations/0014_pharmacy.sql` (a fresh project only needs `schema_full.sql`). If you create staff with the Edge Function, redeploy it so it accepts the new role; "Link an existing login" works without that.
+2. An administrator adds pharmacists under **Staff** (role: Pharmacist).
+3. An administrator lists each medicine under **Inventory** and records the stock received. A medicine that is not in the stock list cannot be dispensed, and the screen says so.
+
+**Day to day**
+- The **Dispensing** tab lists prescriptions waiting at the facility, oldest first. Search by the patient's **card number** (they can show it on their phone), name or medicine.
+- **Dispense** opens a form with a suggested quantity worked out from the prescription (for example 4 tablets, twice a day, for 3 days = 24). It is only a suggestion and only for tablets and capsules; the pharmacist confirms the number.
+- If less than the suggestion is given, it is recorded as a **part fill** and the prescription stays on the waiting list for the balance.
+- Dispensing records who, what and how much, and **reduces stock in the same step**. Stock can never go negative, and two people dispensing at the same moment cannot both take the last box.
+- A prescription can be fully dispensed only once.
+- **History** lists everything dispensed. A mistake can be **reversed** with a reason: the stock goes back and the prescription is waiting again. Nothing is deleted, and who reversed it and why is kept.
+- **Stock** shows medicine levels, read-only, with a reorder flag. Receiving stock stays with the administrator.
+
+**Who sees what**
+- A pharmacist can dispense, reverse, and see pharmacy stock. They cannot open encounters, write prescriptions, register patients, or see finance, staff, settings or the audit log. Access is a normal permission (`dispensing.manage`) on the Access control page, held by Pharmacists and Administrators by default.
+- Doctors and nurses see on a patient's chart whether each prescription has been dispensed.
+- **Patients** see, under their medicines, whether each is *waiting at the pharmacy*, *part collected* or *collected on* a date.
+- Every dispensing and reversal is recorded in the activity log under the pharmacist's name.
+
+### Not covered yet
+
+- **No allergy or interaction checks.** Allergies cannot yet be recorded, so the pharmacy screen cannot warn about them. Build that before relying on this clinically.
+- Dispensing is only for prescriptions from the pharmacist's own facility.
+- No label printing, no link to billing or prices, and no controlled-drug register.
 
 ## Requirements traceability
 

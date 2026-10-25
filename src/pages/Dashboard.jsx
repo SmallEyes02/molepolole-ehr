@@ -1,10 +1,10 @@
 import { useEffect, useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, Navigate } from 'react-router-dom'
 import { Users, Activity, UserPlus } from 'lucide-react'
 import { supabase } from '../lib/supabaseClient'
 import { useAuth } from '../context/AuthContext'
 import PageHeader from '../components/PageHeader'
-import { can } from '../lib/permissions'
+import { can, isAdministrator } from '../lib/permissions'
 
 export default function Dashboard() {
   const { profile } = useAuth()
@@ -38,6 +38,9 @@ export default function Dashboard() {
     setRecentVisits(visits || [])
     setLoading(false)
   }
+
+  // pharmacists work from the pharmacy screen, not the clinical dashboard
+  if (profile && can(profile, 'dispensing.manage') && !isAdministrator(profile.role_id)) return <Navigate to="/pharmacy" replace />
 
   return (
     <div>

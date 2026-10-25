@@ -15,10 +15,15 @@ import Referrals from './pages/Referrals'
 import ActivityLog from './pages/ActivityLog'
 import Terms from './pages/Terms'
 import Privacy from './pages/Privacy'
+import Register from './pages/portal/Register'
+import ForgotPassword from './pages/ForgotPassword'
+import ResetPassword from './pages/ResetPassword'
+import PortalLayout from './pages/portal/PortalLayout'
 
 // Heavier or admin-only screens load on demand, to keep the first load small
 // on slow clinic connections.
 const Reports = lazy(() => import('./pages/Reports'))
+const Pharmacy = lazy(() => import('./pages/Pharmacy'))
 const Staff = lazy(() => import('./pages/admin/Staff'))
 const Appointments = lazy(() => import('./pages/admin/Appointments'))
 const Finance = lazy(() => import('./pages/admin/Finance'))
@@ -59,6 +64,10 @@ function AppRoutes() {
       <Route path="/login" element={<Login />} />
       <Route path="/terms" element={<Terms />} />
       <Route path="/privacy" element={<Privacy />} />
+      <Route path="/register" element={<Register />} />
+      <Route path="/forgot-password" element={<ForgotPassword />} />
+      <Route path="/reset-password" element={<ResetPassword />} />
+      <Route path="/portal" element={<PrivateRoute><PortalLayout /></PrivateRoute>} />
       <Route path="/" element={<PrivateRoute><AppLayout /></PrivateRoute>}>
         <Route index element={<Dashboard />} />
         <Route path="patients" element={<Patients />} />
@@ -69,6 +78,7 @@ function AppRoutes() {
         <Route path="patients/:patientId/refer" element={<PermissionRoute code="referrals.send"><ReferPatient /></PermissionRoute>} />
         <Route path="referrals" element={<Referrals />} />
         <Route path="reports" element={<PermissionRoute code="reports.view"><Reports /></PermissionRoute>} />
+        <Route path="pharmacy" element={<PermissionRoute code="dispensing.manage"><Pharmacy /></PermissionRoute>} />
         <Route path="admin/staff" element={<AdminRoute><Staff /></AdminRoute>} />
         <Route path="admin/appointments" element={<AdminRoute><Appointments /></AdminRoute>} />
         <Route path="admin/finance" element={<AdminRoute><Finance /></AdminRoute>} />

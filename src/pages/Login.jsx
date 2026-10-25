@@ -67,10 +67,16 @@ export default function Login() {
               autoComplete="current-password"
             />
           </div>
+          <p className="text-right text-sm"><Link to="/forgot-password" className="text-accent hover:underline">Forgot your password?</Link></p>
           <button type="submit" disabled={submitting} className="btn-primary w-full">
             {submitting ? 'Signing in...' : 'Sign in'}
           </button>
         </form>
+
+        <p className="mt-4 text-center text-sm text-ink/60">
+          Patient?{' '}
+          <Link to="/register" className="font-medium text-accent hover:underline">Create your patient account</Link>
+        </p>
 
         <p className="mt-4 text-center text-xs text-ink/40">
           By signing in you agree to the{' '}

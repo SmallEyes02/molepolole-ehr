@@ -8,11 +8,29 @@ import Banner from '../../components/Banner'
 const blankNew = { first_name: '', last_name: '', email: '', password: '', role_id: 2, department_id: '', phone: '' }
 
 async function functionError(error) {
+  // FunctionsFetchError = no usable answer at all (not deployed, wrong name, CORS).
+  if (error.name === 'FunctionsFetchError' || error.name === 'FunctionsRelayError') {
+    return 'Could not reach the manage-staff function. Either deploy it (see the README, with Verify JWT turned off), or use "Link an existing login" instead.'
+  }
+
+  // FunctionsHttpError = the platform or the function answered with an error status.
+  const res = error.context
+  const status = res?.status
+  let text = ''
+  try { text = await res.text() } catch { /* ignore */ }
+  let detail = text
+  let fromFunction = false
   try {
-    const body = await error.context.json()
-    if (body?.error) return body.error
-  } catch { /* fall through */ }
-  return error.message || 'The request failed.'
+    const body = JSON.parse(text)
+    if (body?.error) { detail = body.error; fromFunction = true }   // our own, readable message
+    else detail = body?.message || body?.msg || text
+  } catch { /* plain text */ }
+
+  if (fromFunction) return detail
+  if (status === 401) return `Supabase rejected the request before the function ran (401: ${detail || 'Invalid JWT'}). In Edge Functions, open manage-staff, turn Verify JWT off and redeploy.`
+  if (status === 404) return 'Supabase cannot find a function named manage-staff (404). Check the name is exactly manage-staff and that it is deployed.'
+  if (status >= 500) return `The function failed to start or crashed (${status}: ${detail}). Open Edge Functions, manage-staff, Logs for the cause.`
+  return `The request failed (${status || 'no status'}${detail ? ': ' + detail : ''}).`
 }
 
 export default function Staff() {
@@ -23,6 +41,7 @@ export default function Staff() {
   const [loading, setLoading] = useState(true)
   const [message, setMessage] = useState(null)
   const [showAdd, setShowAdd] = useState(false)
+  const [addMode, setAddMode] = useState('create') // 'create' | 'link'
   const [form, setForm] = useState(blankNew)
   const [editing, setEditing] = useState(null) // { id, mode: 'edit' | 'password', draft }
   const [newDept, setNewDept] = useState('')
@@ -48,10 +67,28 @@ export default function Staff() {
   const fail = (text) => setMessage({ kind: 'error', text })
   const ok = (text) => setMessage({ kind: 'success', text })
 
+  async function linkStaff() {
+    const { error } = await supabase.rpc('link_staff_account', {
+      p_email: form.email,
+      p_first_name: form.first_name,
+      p_last_name: form.last_name,
+      p_role_id: Number(form.role_id),
+      p_department_id: form.department_id || null,
+      p_phone: form.phone || null
+    })
+    setBusy(false)
+    if (error) return fail(error.message)
+    ok(`${form.first_name} ${form.last_name} has been linked and can now sign in.`)
+    setForm(blankNew)
+    setShowAdd(false)
+    load()
+  }
+
   async function createStaff(e) {
     e.preventDefault()
     setMessage(null)
     setBusy(true)
+    if (addMode === 'link') return linkStaff()
     const { error } = await supabase.functions.invoke('manage-staff', {
       body: { action: 'create', ...form, role_id: Number(form.role_id), department_id: form.department_id || null }
     })
@@ -128,12 +165,26 @@ export default function Staff() {
 
         {showAdd && (
           <form onSubmit={createStaff} className="card space-y-4 p-4">
-            <h2 className="text-sm font-semibold text-ink">New staff account</h2>
+            <div className="flex gap-1 border-b border-border">
+              {[['create', 'Create new login'], ['link', 'Link an existing login']].map(([k, label]) => (
+                <button type="button" key={k} onClick={() => setAddMode(k)}
+                  className={`px-3 py-2 text-sm font-medium ${addMode === k ? 'border-b-2 border-ink text-ink' : 'text-ink/50 hover:text-ink'}`}>
+                  {label}
+                </button>
+              ))}
+            </div>
+            {addMode === 'link' && (
+              <Banner kind="info">
+                First create the login in the Supabase dashboard under Authentication, Users, Add user (tick Auto Confirm User). Then enter the same email here to give that person a role and facility.
+              </Banner>
+            )}
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               <div><label className="label">First name</label><input required className="input" value={form.first_name} onChange={(e) => setForm({ ...form, first_name: e.target.value })} /></div>
               <div><label className="label">Last name</label><input required className="input" value={form.last_name} onChange={(e) => setForm({ ...form, last_name: e.target.value })} /></div>
-              <div><label className="label">Work email (used to sign in)</label><input required type="email" className="input" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} /></div>
-              <div><label className="label">Temporary password (min 8 characters)</label><input required minLength={8} type="text" className="input" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} /></div>
+              <div><label className="label">{addMode === 'link' ? 'Email of the existing login' : 'Work email (used to sign in)'}</label><input required type="email" className="input" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} /></div>
+              {addMode === 'create' && (
+                <div><label className="label">Temporary password (min 8 characters)</label><input required minLength={8} type="text" className="input" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} /></div>
+              )}
               <div>
                 <label className="label">Role</label>
                 <select className="input" value={form.role_id} onChange={(e) => setForm({ ...form, role_id: e.target.value })}>
@@ -150,7 +201,7 @@ export default function Staff() {
               <div><label className="label">Phone</label><input className="input" value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} /></div>
             </div>
             <div className="flex gap-2">
-              <button type="submit" disabled={busy} className="btn-primary">{busy ? 'Creating...' : 'Create account'}</button>
+              <button type="submit" disabled={busy} className="btn-primary">{busy ? 'Saving...' : addMode === 'link' ? 'Link login' : 'Create account'}</button>
               <button type="button" className="btn-secondary" onClick={() => setShowAdd(false)}>Cancel</button>
             </div>
           </form>

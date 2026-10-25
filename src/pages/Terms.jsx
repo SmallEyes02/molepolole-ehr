@@ -44,12 +44,17 @@ export default function Terms() {
           </section>
 
           <section>
-            <h2 className="mb-1 font-semibold text-ink">7. Changes to these terms</h2>
+            <h2 className="mb-1 font-semibold text-ink">7. Patient portal</h2>
+            <p>Patients who are given portal access must keep their login and activation code private and must not share them. Information shown in the portal is a summary for the patient's reference and does not replace advice from a clinician. Portal access does not expire. Anyone who can sign in to your account can see your records, so keep your phone and password safe and tell the clinic straight away if you lose them. A facility may withdraw portal access at any time.</p>
+          </section>
+
+          <section>
+            <h2 className="mb-1 font-semibold text-ink">8. Changes to these terms</h2>
             <p>These terms may be revised as the system moves from prototype to production. Continued use after a revision constitutes acceptance of the updated terms.</p>
           </section>
 
           <section>
-            <h2 className="mb-1 font-semibold text-ink">8. Contact</h2>
+            <h2 className="mb-1 font-semibold text-ink">9. Contact</h2>
             <p>Questions about these terms should be directed to your facility's system administrator.</p>
           </section>
         </div>

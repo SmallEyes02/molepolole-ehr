@@ -16,8 +16,8 @@ export default function PatientPicker({ value, onChange }) {
       const q = query.replace(/[,()]/g, ' ')
       const { data } = await supabase
         .from('patients')
-        .select('id, first_name, last_name, omang_number')
-        .or(`first_name.ilike.%${q}%,last_name.ilike.%${q}%,omang_number.ilike.%${q}%`)
+        .select('id, first_name, last_name, omang_number, card_number')
+        .or(`first_name.ilike.%${q}%,last_name.ilike.%${q}%,omang_number.ilike.%${q}%,card_number.ilike.%${q}%`)
         .limit(8)
       setResults(data || [])
     }, 200)
@@ -38,14 +38,14 @@ export default function PatientPicker({ value, onChange }) {
   return (
     <div className="relative">
       <Search size={16} className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-ink/40" />
-      <input className="input pl-9" placeholder="Search patient by name or Omang" value={query} onChange={(e) => setQuery(e.target.value)} />
+      <input className="input pl-9" placeholder="Search by name, Omang or card number" value={query} onChange={(e) => setQuery(e.target.value)} />
       {results.length > 0 && (
         <div className="absolute z-10 mt-1 w-full rounded-sm border border-border bg-white shadow-sm">
           {results.map((r) => (
             <button type="button" key={r.id} onClick={() => { onChange(r); setQuery('') }}
               className="flex w-full items-center justify-between px-3 py-2 text-left text-sm hover:bg-bg">
               <span className="text-ink">{r.first_name} {r.last_name}</span>
-              <span className="font-mono text-xs text-ink/40">{r.omang_number || ''}</span>
+              <span className="font-mono text-xs text-ink/40">{r.card_number}</span>
             </button>
           ))}
         </div>

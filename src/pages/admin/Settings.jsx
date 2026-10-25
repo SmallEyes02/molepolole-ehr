@@ -33,6 +33,8 @@ export default function Settings() {
     setMessage(null)
     if (!facility.name.trim()) return setMessage({ kind: 'error', text: 'The facility name is required.' })
     if (!/^[A-Za-z]{3}$/.test(values.currency_code || '')) return setMessage({ kind: 'error', text: 'Currency must be a 3-letter code such as BWP.' })
+    const hrs = Number(values.reminder_hours_before)
+    if (!Number.isInteger(hrs) || hrs < 1 || hrs > 168) return setMessage({ kind: 'error', text: 'Reminder time must be a whole number of hours between 1 and 168.' })
     if (!(Number(values.appointment_slot_minutes) >= 5)) return setMessage({ kind: 'error', text: 'Appointment length must be at least 5 minutes.' })
     setSaving(true)
 
@@ -88,7 +90,7 @@ export default function Settings() {
             <div key={d.key}>
               <label className="label">{d.label}</label>
               <input className="input max-w-xs" value={values[d.key] ?? ''}
-                type={d.key.endsWith('_time') ? 'time' : d.key === 'appointment_slot_minutes' ? 'number' : 'text'}
+                type={d.key.endsWith('_time') ? 'time' : (d.key === 'appointment_slot_minutes' || d.key === 'reminder_hours_before') ? 'number' : 'text'}
                 onChange={(e) => setValues({ ...values, [d.key]: e.target.value })} />
               {d.description && <p className="mt-1 text-xs text-ink/50">{d.description}</p>}
             </div>

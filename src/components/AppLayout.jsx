@@ -1,6 +1,6 @@
 import { Suspense, useState } from 'react'
-import { Outlet, NavLink } from 'react-router-dom'
-import { LayoutDashboard, Users, LogOut, Cross, ArrowLeftRight, BarChart3, ShieldCheck, Menu, X, UserCog, CalendarDays, Receipt, Package, KeyRound, Settings as SettingsIcon } from 'lucide-react'
+import { Outlet, NavLink, Navigate } from 'react-router-dom'
+import { LayoutDashboard, Users, LogOut, Cross, ArrowLeftRight, BarChart3, ShieldCheck, Menu, X, UserCog, CalendarDays, Receipt, Package, KeyRound, Settings as SettingsIcon, Pill } from 'lucide-react'
 import { useAuth } from '../context/AuthContext'
 import { isAdministrator, can } from '../lib/permissions'
 
@@ -25,9 +25,13 @@ export default function AppLayout() {
   const [menuOpen, setMenuOpen] = useState(false)
 
   const admin = isAdministrator(profile?.role_id)
-  const navItems = can(profile, 'reports.view')
-    ? [...mainNav, { to: '/reports', label: 'Reports', icon: BarChart3, end: false }]
-    : mainNav
+  const navItems = [
+    ...mainNav,
+    ...(can(profile, 'dispensing.manage') ? [{ to: '/pharmacy', label: 'Pharmacy', icon: Pill, end: false }] : []),
+    ...(can(profile, 'reports.view') ? [{ to: '/reports', label: 'Reports', icon: BarChart3, end: false }] : [])
+  ]
+
+  if (profile && profile.kind !== 'staff') return <Navigate to="/portal" replace />
 
   return (
     <div className="flex min-h-screen flex-col bg-bg md:flex-row">

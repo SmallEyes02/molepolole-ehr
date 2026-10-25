@@ -1213,3 +1213,966 @@ insert into setting_definitions (key, label, default_value, description) values
   ('clinic_opening_time', 'Opening time', '07:30', 'Start of the working day'),
   ('clinic_closing_time', 'Closing time', '16:30', 'End of the working day')
 on conflict (key) do nothing;
+
+-- =====================================================================
+-- LINK EXISTING LOGIN (migration 0011)
+-- =====================================================================
+
+
+create or replace function link_staff_account(
+  p_email text,
+  p_first_name text,
+  p_last_name text,
+  p_role_id smallint,
+  p_department_id uuid default null,
+  p_phone text default null
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public, auth
+as $$
+declare
+  v_user uuid;
+begin
+  if not is_admin() then
+    raise exception 'Administrator access is required';
+  end if;
+
+  if coalesce(trim(p_first_name), '') = '' or coalesce(trim(p_last_name), '') = '' then
+    raise exception 'First and last name are required';
+  end if;
+
+  if not exists (select 1 from roles where id = p_role_id) then
+    raise exception 'Choose a valid role';
+  end if;
+
+  select id into v_user from auth.users where lower(email) = lower(trim(p_email));
+  if v_user is null then
+    raise exception 'No login exists for that email. Create it first under Authentication, Users in Supabase.';
+  end if;
+
+  if exists (select 1 from staff where id = v_user) then
+    raise exception 'That login is already linked to a staff member';
+  end if;
+
+  if p_department_id is not null and not exists (
+    select 1 from departments where id = p_department_id and facility_id = my_facility_id()
+  ) then
+    raise exception 'That department does not belong to your facility';
+  end if;
+
+  insert into staff (id, facility_id, role_id, department_id, first_name, last_name, phone)
+  values (v_user, my_facility_id(), p_role_id, p_department_id, trim(p_first_name), trim(p_last_name), nullif(trim(coalesce(p_phone, '')), ''));
+
+  return v_user;
+end;
+$$;
+
+revoke execute on function link_staff_account(text, text, text, smallint, uuid, text) from public, anon;
+do $$
+begin
+  if exists (select 1 from pg_roles where rolname = 'authenticated') then
+    grant execute on function link_staff_account(text, text, text, smallint, uuid, text) to authenticated;
+  end if;
+end $$;
+
+drop trigger if exists audit_staff on staff;
+create trigger audit_staff after insert or update on staff
+  for each row execute function log_audit_event();
+
+-- =====================================================================
+-- PATIENT PORTAL (migration 0012)
+-- =====================================================================
+
+
+create extension if not exists "pgcrypto";
+
+-- ---------------------------------------------------------------------
+-- A. ACCOUNTS AND ACTIVATION CODES
+-- ---------------------------------------------------------------------
+
+create table if not exists patient_accounts (
+  user_id uuid primary key references auth.users(id) on delete cascade,
+  patient_id uuid not null unique references patients(id) on delete cascade,
+  created_by uuid references staff(id),
+  created_at timestamptz not null default now()
+);
+
+create table if not exists portal_invites (
+  id uuid primary key default gen_random_uuid(),
+  patient_id uuid not null references patients(id) on delete cascade,
+  code_hash bytea not null unique,
+  created_by uuid references staff(id),
+  created_at timestamptz not null default now(),
+  expires_at timestamptz not null,
+  used_at timestamptz,
+  used_by uuid references auth.users(id)
+);
+create index if not exists idx_portal_invites_patient on portal_invites (patient_id);
+
+create table if not exists portal_claim_attempts (
+  id bigserial primary key,
+  user_id uuid not null,
+  attempted_at timestamptz not null default now()
+);
+create index if not exists idx_claim_attempts_user on portal_claim_attempts (user_id, attempted_at);
+
+create or replace function my_patient_id()
+returns uuid
+language sql stable security definer set search_path = public
+as $$
+  select patient_id from patient_accounts where user_id = auth.uid();
+$$;
+
+insert into permissions (code, description) values
+  ('portal.manage', 'Give patients portal access and revoke it')
+on conflict (code) do nothing;
+
+insert into role_permissions (role_id, permission_code) values
+  (1, 'portal.manage'), (5, 'portal.manage')
+on conflict (role_id, permission_code) do nothing;
+
+-- staff create a code for a patient at their own facility
+create or replace function create_portal_invite(p_patient_id uuid)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  alphabet constant text := 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';   -- no 0/O/1/I
+  v_bytes bytea;
+  v_code text := '';
+  v_expires timestamptz := now() + interval '7 days';
+  i int;
+begin
+  if not has_permission('portal.manage') then
+    raise exception 'You do not have permission to manage portal access';
+  end if;
+
+  if not exists (select 1 from patients where id = p_patient_id and registered_facility_id = my_facility_id()) then
+    raise exception 'Patient not found at your facility';
+  end if;
+
+  if exists (select 1 from patient_accounts where patient_id = p_patient_id) then
+    raise exception 'This patient already has portal access';
+  end if;
+
+  -- a new code replaces any earlier unused one
+  update portal_invites set expires_at = now()
+   where patient_id = p_patient_id and used_at is null and expires_at > now();
+
+  v_bytes := gen_random_bytes(8);
+  for i in 0..7 loop
+    v_code := v_code || substr(alphabet, (get_byte(v_bytes, i) % 32) + 1, 1);
+  end loop;
+
+  insert into portal_invites (patient_id, code_hash, created_by, expires_at)
+  values (p_patient_id, digest(v_code, 'sha256'), auth.uid(), v_expires);
+
+  return jsonb_build_object('code', substr(v_code, 1, 4) || '-' || substr(v_code, 5, 4), 'expires_at', v_expires);
+end;
+$$;
+
+-- a signed-in user redeems a code to link their login to a patient record.
+-- Returns a status text instead of raising, so failed attempts are recorded.
+create or replace function claim_portal_invite(p_code text)
+returns text
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_uid uuid := auth.uid();
+  v_norm text;
+  v_invite portal_invites%rowtype;
+begin
+  if v_uid is null then return 'not_signed_in'; end if;
+  if exists (select 1 from staff where id = v_uid) then return 'not_allowed'; end if;
+  if exists (select 1 from patient_accounts where user_id = v_uid) then return 'already_linked'; end if;
+
+  if (select count(*) from portal_claim_attempts
+       where user_id = v_uid and attempted_at > now() - interval '15 minutes') >= 5 then
+    return 'locked';
+  end if;
+
+  v_norm := upper(regexp_replace(coalesce(p_code, ''), '[^A-Za-z0-9]', '', 'g'));
+
+  select * into v_invite from portal_invites
+   where code_hash = digest(v_norm, 'sha256') and used_at is null and expires_at > now()
+   for update;
+
+  if not found or exists (select 1 from patient_accounts where patient_id = v_invite.patient_id) then
+    insert into portal_claim_attempts (user_id) values (v_uid);
+    return 'invalid';
+  end if;
+
+  insert into patient_accounts (user_id, patient_id, created_by)
+  values (v_uid, v_invite.patient_id, v_invite.created_by);
+
+  update portal_invites set used_at = now(), used_by = v_uid where id = v_invite.id;
+  return 'ok';
+end;
+$$;
+
+alter table patient_accounts enable row level security;
+alter table portal_invites enable row level security;
+alter table portal_claim_attempts enable row level security;   -- no policies: only the functions touch it
+
+drop policy if exists "patient reads own account" on patient_accounts;
+create policy "patient reads own account" on patient_accounts for select using (user_id = auth.uid());
+
+drop policy if exists "staff read portal accounts" on patient_accounts;
+create policy "staff read portal accounts" on patient_accounts for select using (
+  has_permission('portal.manage')
+  and patient_id in (select id from patients where registered_facility_id = my_facility_id()));
+
+drop policy if exists "staff revoke portal access" on patient_accounts;
+create policy "staff revoke portal access" on patient_accounts for delete using (
+  has_permission('portal.manage')
+  and patient_id in (select id from patients where registered_facility_id = my_facility_id()));
+
+drop policy if exists "staff read portal invites" on portal_invites;
+create policy "staff read portal invites" on portal_invites for select using (
+  has_permission('portal.manage')
+  and patient_id in (select id from patients where registered_facility_id = my_facility_id()));
+
+-- ---------------------------------------------------------------------
+-- B. PATIENTS READ THEIR OWN RECORD (read-only)
+-- ---------------------------------------------------------------------
+
+drop policy if exists "patient reads own record" on patients;
+create policy "patient reads own record" on patients for select using (id = my_patient_id());
+
+drop policy if exists "patient reads own visits" on visits;
+create policy "patient reads own visits" on visits for select using (patient_id = my_patient_id());
+
+drop policy if exists "patient reads own vitals" on vitals;
+create policy "patient reads own vitals" on vitals for select using (
+  exists (select 1 from visits v where v.id = vitals.visit_id and v.patient_id = my_patient_id()));
+
+drop policy if exists "patient reads own diagnoses" on visit_diagnoses;
+create policy "patient reads own diagnoses" on visit_diagnoses for select using (
+  exists (select 1 from visits v where v.id = visit_diagnoses.visit_id and v.patient_id = my_patient_id()));
+
+drop policy if exists "patient reads own prescriptions" on prescriptions;
+create policy "patient reads own prescriptions" on prescriptions for select using (
+  exists (select 1 from visits v where v.id = prescriptions.visit_id and v.patient_id = my_patient_id()));
+
+-- Appointments stay administrator-only at the table level. Patients see
+-- their own through this view, which adds the clinician and department
+-- names they could not otherwise read. It only ever returns the signed-in
+-- patient's rows.
+create or replace view my_appointments as
+select
+  a.id as appointment_id,
+  a.scheduled_at,
+  a.duration_minutes,
+  a.reason,
+  a.status,
+  a.cancellation_reason,
+  f.name as facility_name,
+  d.name as department_name,
+  case when s.id is null then null else s.first_name || ' ' || s.last_name end as clinician_name
+from appointments a
+join facilities f on f.id = a.facility_id
+left join departments d on d.id = a.department_id
+left join staff s on s.id = a.staff_id
+where a.patient_id = my_patient_id();
+
+-- ---------------------------------------------------------------------
+-- C. NOTIFICATIONS
+--    Stored as facts (what happened, to which appointment, for which
+--    time). The wording is produced when displayed, so nothing is
+--    duplicated and a changed clinic name never leaves stale text.
+-- ---------------------------------------------------------------------
+
+create table if not exists notifications (
+  id uuid primary key default gen_random_uuid(),
+  patient_id uuid not null references patients(id) on delete cascade,
+  appointment_id uuid not null references appointments(id) on delete cascade,
+  kind text not null check (kind in ('scheduled','rescheduled','cancelled','reminder')),
+  for_time timestamptz not null,
+  created_at timestamptz not null default now(),
+  read_at timestamptz
+);
+create index if not exists idx_notifications_patient on notifications (patient_id, created_at desc);
+-- the same event is never recorded twice (this is what makes reminders safe to generate repeatedly)
+create unique index if not exists uq_notification_event on notifications (appointment_id, kind, for_time);
+
+alter table notifications enable row level security;
+drop policy if exists "patient reads own notifications" on notifications;
+create policy "patient reads own notifications" on notifications for select using (patient_id = my_patient_id());
+
+-- booking, moving or cancelling an appointment notifies patients who have portal access
+create or replace function notify_appointment_change()
+returns trigger
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if not exists (select 1 from patient_accounts where patient_id = new.patient_id) then
+    return new;
+  end if;
+
+  if tg_op = 'INSERT' then
+    if new.status = 'scheduled' then
+      insert into notifications (patient_id, appointment_id, kind, for_time)
+      values (new.patient_id, new.id, 'scheduled', new.scheduled_at)
+      on conflict do nothing;
+    end if;
+  elsif tg_op = 'UPDATE' then
+    if new.status = 'cancelled' and old.status <> 'cancelled' then
+      insert into notifications (patient_id, appointment_id, kind, for_time)
+      values (new.patient_id, new.id, 'cancelled', new.scheduled_at)
+      on conflict do nothing;
+    elsif new.status = 'scheduled' and new.scheduled_at <> old.scheduled_at then
+      insert into notifications (patient_id, appointment_id, kind, for_time)
+      values (new.patient_id, new.id, 'rescheduled', new.scheduled_at)
+      on conflict do nothing;
+    end if;
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_notify_appointment on appointments;
+create trigger trg_notify_appointment
+  after insert or update on appointments
+  for each row execute function notify_appointment_change();
+
+-- Creates a reminder for every scheduled appointment starting within the
+-- facility's "reminder_hours_before" setting. Safe to run as often as you
+-- like. p_patient limits it to one patient. Not callable by app users.
+create or replace function generate_appointment_reminders(p_patient uuid default null)
+returns integer
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_count integer;
+begin
+  insert into notifications (patient_id, appointment_id, kind, for_time)
+  select a.patient_id, a.id, 'reminder', a.scheduled_at
+  from appointments a
+  join patient_accounts pa on pa.patient_id = a.patient_id
+  cross join lateral (
+    select coalesce(
+      (select case when fs.value ~ '^[0-9]{1,3}$' then fs.value::int end
+         from facility_settings fs where fs.facility_id = a.facility_id and fs.key = 'reminder_hours_before'),
+      (select case when sd.default_value ~ '^[0-9]{1,3}$' then sd.default_value::int end
+         from setting_definitions sd where sd.key = 'reminder_hours_before'),
+      24) as hrs
+  ) h
+  where a.status = 'scheduled'
+    and a.scheduled_at > now()
+    and a.scheduled_at <= now() + make_interval(hours => h.hrs)
+    and (p_patient is null or a.patient_id = p_patient)
+  on conflict do nothing;
+
+  get diagnostics v_count = row_count;
+  return v_count;
+end;
+$$;
+
+-- what the portal calls on load: reminders for the signed-in patient only
+create or replace function refresh_my_reminders()
+returns integer
+language sql
+security definer
+set search_path = public
+as $$
+  select case when my_patient_id() is null then 0 else generate_appointment_reminders(my_patient_id()) end;
+$$;
+
+create or replace function mark_notifications_read()
+returns void
+language sql
+security definer
+set search_path = public
+as $$
+  update notifications set read_at = now()
+   where patient_id = my_patient_id() and read_at is null;
+$$;
+
+-- function permissions: nobody but the database owner may generate reminders
+-- for everyone; the portal functions are for signed-in users only
+do $$
+declare
+  r text;
+begin
+  revoke execute on function generate_appointment_reminders(uuid) from public;
+  revoke execute on function create_portal_invite(uuid) from public;
+  revoke execute on function claim_portal_invite(text) from public;
+  revoke execute on function refresh_my_reminders() from public;
+  revoke execute on function mark_notifications_read() from public;
+  foreach r in array array['anon', 'authenticated'] loop
+    if exists (select 1 from pg_roles where rolname = r) then
+      execute format('revoke execute on function generate_appointment_reminders(uuid) from %I', r);
+    end if;
+  end loop;
+  foreach r in array array['authenticated'] loop
+    if exists (select 1 from pg_roles where rolname = r) then
+      execute format('grant execute on function create_portal_invite(uuid) to %I', r);
+      execute format('grant execute on function claim_portal_invite(text) to %I', r);
+      execute format('grant execute on function refresh_my_reminders() to %I', r);
+      execute format('grant execute on function mark_notifications_read() to %I', r);
+    end if;
+  end loop;
+  if exists (select 1 from pg_roles where rolname = 'anon') then
+    revoke all on my_appointments from anon;
+  end if;
+end $$;
+
+-- ---------------------------------------------------------------------
+-- D. AUDIT AND SETTINGS
+--    (claims by patients are recorded in portal_invites.used_at/used_by;
+--     the audit log only records staff, so it is not triggered by patients)
+-- ---------------------------------------------------------------------
+
+drop trigger if exists audit_portal_invites on portal_invites;
+create trigger audit_portal_invites after insert on portal_invites
+  for each row execute function log_audit_event();
+
+drop trigger if exists audit_patient_accounts_revoke on patient_accounts;
+create trigger audit_patient_accounts_revoke after delete on patient_accounts
+  for each row execute function log_audit_event_keys('user_id');
+
+insert into setting_definitions (key, label, default_value, description) values
+  ('reminder_hours_before', 'Appointment reminder (hours before)', '24', 'Patients with portal access are reminded this many hours before an appointment')
+on conflict (key) do nothing;
+
+-- =====================================================================
+-- DIGITAL HEALTH CARD (migration 0013)
+-- =====================================================================
+
+
+-- ---------------------------------------------------------------------
+-- A. ACTIVATION CODES: NO EXPIRY, BUT CANCELLABLE
+-- ---------------------------------------------------------------------
+
+alter table portal_invites alter column expires_at drop not null;   -- NULL = never expires
+alter table portal_invites add column if not exists cancelled_at timestamptz;
+
+create or replace function create_portal_invite(p_patient_id uuid)
+returns jsonb
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  alphabet constant text := 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';   -- no 0/O/1/I
+  v_bytes bytea;
+  v_code text := '';
+  i int;
+begin
+  if not has_permission('portal.manage') then
+    raise exception 'You do not have permission to manage portal access';
+  end if;
+
+  if not exists (select 1 from patients where id = p_patient_id and registered_facility_id = my_facility_id()) then
+    raise exception 'Patient not found at your facility';
+  end if;
+
+  if exists (select 1 from patient_accounts where patient_id = p_patient_id) then
+    raise exception 'This patient already has portal access';
+  end if;
+
+  -- a new code replaces any earlier unused one
+  update portal_invites set cancelled_at = now()
+   where patient_id = p_patient_id and used_at is null and cancelled_at is null;
+
+  v_bytes := gen_random_bytes(8);
+  for i in 0..7 loop
+    v_code := v_code || substr(alphabet, (get_byte(v_bytes, i) % 32) + 1, 1);
+  end loop;
+
+  insert into portal_invites (patient_id, code_hash, created_by, expires_at)
+  values (p_patient_id, digest(v_code, 'sha256'), auth.uid(), null);
+
+  return jsonb_build_object('code', substr(v_code, 1, 4) || '-' || substr(v_code, 5, 4), 'expires_at', null);
+end;
+$$;
+
+create or replace function claim_portal_invite(p_code text)
+returns text
+language plpgsql
+security definer
+set search_path = public, extensions
+as $$
+declare
+  v_uid uuid := auth.uid();
+  v_norm text;
+  v_invite portal_invites%rowtype;
+begin
+  if v_uid is null then return 'not_signed_in'; end if;
+  if exists (select 1 from staff where id = v_uid) then return 'not_allowed'; end if;
+  if exists (select 1 from patient_accounts where user_id = v_uid) then return 'already_linked'; end if;
+
+  if (select count(*) from portal_claim_attempts
+       where user_id = v_uid and attempted_at > now() - interval '15 minutes') >= 5 then
+    return 'locked';
+  end if;
+
+  v_norm := upper(regexp_replace(coalesce(p_code, ''), '[^A-Za-z0-9]', '', 'g'));
+
+  select * into v_invite from portal_invites
+   where code_hash = digest(v_norm, 'sha256')
+     and used_at is null
+     and cancelled_at is null
+     and (expires_at is null or expires_at > now())
+   for update;
+
+  if not found or exists (select 1 from patient_accounts where patient_id = v_invite.patient_id) then
+    insert into portal_claim_attempts (user_id) values (v_uid);
+    return 'invalid';
+  end if;
+
+  insert into patient_accounts (user_id, patient_id, created_by)
+  values (v_uid, v_invite.patient_id, v_invite.created_by);
+
+  update portal_invites set used_at = now(), used_by = v_uid where id = v_invite.id;
+  return 'ok';
+end;
+$$;
+
+-- staff can withdraw a code that has not been used (for example one that was lost)
+create or replace function cancel_portal_invite(p_patient_id uuid)
+returns integer
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_count integer;
+begin
+  if not has_permission('portal.manage') then
+    raise exception 'You do not have permission to manage portal access';
+  end if;
+
+  if not exists (select 1 from patients where id = p_patient_id and registered_facility_id = my_facility_id()) then
+    raise exception 'Patient not found at your facility';
+  end if;
+
+  update portal_invites set cancelled_at = now()
+   where patient_id = p_patient_id and used_at is null and cancelled_at is null;
+  get diagnostics v_count = row_count;
+
+  if v_count > 0 then
+    insert into audit_log (staff_id, table_name, record_id, action)
+    values (auth.uid(), 'portal_invites', p_patient_id::text, 'delete');
+  end if;
+  return v_count;
+end;
+$$;
+
+do $$
+declare
+  r text;
+begin
+  revoke execute on function cancel_portal_invite(uuid) from public;
+  foreach r in array array['authenticated'] loop
+    if exists (select 1 from pg_roles where rolname = r) then
+      execute format('grant execute on function cancel_portal_invite(uuid) to %I', r);
+    end if;
+  end loop;
+end $$;
+
+-- ---------------------------------------------------------------------
+-- B. CARD NUMBER
+-- ---------------------------------------------------------------------
+
+create sequence if not exists patient_card_seq;
+alter table patients add column if not exists card_number text;
+
+-- number existing patients in the order they were registered
+do $$
+declare
+  r record;
+begin
+  for r in select id from patients where card_number is null order by created_at, id loop
+    update patients
+       set card_number = 'MP' || lpad(nextval('patient_card_seq')::text, 6, '0')
+     where id = r.id;
+  end loop;
+end $$;
+
+alter table patients alter column card_number set default ('MP' || lpad(nextval('patient_card_seq')::text, 6, '0'));
+alter table patients alter column card_number set not null;
+create unique index if not exists uq_patients_card_number on patients (card_number);
+
+-- a card number is printed and handed to the patient, so it can never be changed
+create or replace function guard_card_number()
+returns trigger
+language plpgsql
+as $$
+begin
+  if new.card_number is distinct from old.card_number then
+    raise exception 'A patient card number cannot be changed';
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_guard_card_number on patients;
+create trigger trg_guard_card_number
+  before update on patients
+  for each row execute function guard_card_number();
+
+-- =====================================================================
+-- PHARMACY (migration 0014)
+-- =====================================================================
+
+
+-- ---------------------------------------------------------------------
+-- A. ROLE AND PERMISSION
+-- ---------------------------------------------------------------------
+
+insert into roles (id, name) values (6, 'Pharmacist') on conflict (id) do nothing;
+
+insert into permissions (code, description) values
+  ('dispensing.manage', 'Dispense medicines and view pharmacy stock')
+on conflict (code) do nothing;
+
+insert into role_permissions (role_id, permission_code) values
+  (1, 'dispensing.manage'), (6, 'dispensing.manage')
+on conflict (role_id, permission_code) do nothing;
+
+-- ---------------------------------------------------------------------
+-- B. DISPENSINGS
+-- ---------------------------------------------------------------------
+
+create table if not exists dispensings (
+  id uuid primary key default gen_random_uuid(),
+  prescription_id uuid not null references prescriptions(id) on delete cascade,
+  quantity integer not null check (quantity > 0),
+  is_partial boolean not null default false,        -- true = balance still owed to the patient
+  note text,
+  dispensed_by uuid references staff(id),
+  dispensed_at timestamptz not null default now(),
+  reversed_at timestamptz,
+  reversed_by uuid references staff(id),
+  reversal_reason text,
+  check ((reversed_at is null) = (reversed_by is null) and (reversed_at is null) = (reversal_reason is null))
+);
+create index if not exists idx_dispensings_prescription on dispensings (prescription_id);
+create index if not exists idx_dispensings_time on dispensings (dispensed_at desc);
+
+-- a prescription can only be fully dispensed once (reversals free it up again)
+create unique index if not exists uq_dispensing_final
+  on dispensings (prescription_id) where is_partial = false and reversed_at is null;
+
+-- ---------------------------------------------------------------------
+-- C. STOCK ON HAND FOR A MEDICINE (calculated, never stored)
+--    Runs with owner rights so a pharmacist can see the number without
+--    being able to read the administrator-only inventory tables. It only
+--    answers for the caller's own facility, and only for administrators
+--    and pharmacists.
+-- ---------------------------------------------------------------------
+
+create or replace function medicine_stock(p_facility uuid, p_medication integer)
+returns bigint
+language sql
+stable
+security definer
+set search_path = public
+as $$
+  select case when it.id is null then null else
+           coalesce((select sum(sm.quantity_change) from stock_movements sm where sm.inventory_item_id = it.id), 0)
+           - coalesce((select sum(d.quantity)
+                         from dispensings d
+                         join prescriptions p on p.id = d.prescription_id
+                         join visits v on v.id = p.visit_id
+                        where d.reversed_at is null
+                          and p.medication_id = it.medication_id
+                          and v.facility_id = it.facility_id), 0)
+         end
+    from (select 1) x
+    left join inventory_items it on it.facility_id = p_facility and it.medication_id = p_medication
+   where p_facility = my_facility_id()
+     and (is_admin() or has_permission('dispensing.manage'));
+$$;
+
+-- the administrator's stock list now takes dispensing into account
+create or replace view stock_levels with (security_invoker = on) as
+select
+  inventory_item_id, facility_id, category, item_name, unit, reorder_level, on_hand,
+  on_hand <= reorder_level as is_low
+from (
+  select
+    it.id as inventory_item_id,
+    it.facility_id,
+    case when it.medication_id is not null then 'medicine' else 'supply' end as category,
+    coalesce(m.name || ' (' || m.form || ', ' || m.strength || ')', it.supply_name) as item_name,
+    it.unit,
+    it.reorder_level,
+    coalesce(
+      case when it.medication_id is not null then medicine_stock(it.facility_id, it.medication_id) else s.on_hand end,
+      0)::bigint as on_hand
+  from inventory_items it
+  left join medications m on m.id = it.medication_id
+  left join (select inventory_item_id, sum(quantity_change) as on_hand from stock_movements group by inventory_item_id) s
+    on s.inventory_item_id = it.id
+) q;
+
+-- an administrator's manual adjustment must not push a medicine below what has been dispensed
+create or replace function check_stock_not_negative()
+returns trigger
+language plpgsql
+as $$
+declare
+  v_on_hand bigint;
+  v_med integer;
+  v_fac uuid;
+begin
+  select medication_id, facility_id into v_med, v_fac
+    from inventory_items where id = new.inventory_item_id for update;   -- serialises with dispensing
+
+  if v_med is not null then
+    v_on_hand := medicine_stock(v_fac, v_med);
+  else
+    select coalesce(sum(quantity_change), 0) into v_on_hand
+      from stock_movements where inventory_item_id = new.inventory_item_id;
+  end if;
+
+  if coalesce(v_on_hand, 0) + new.quantity_change < 0 then
+    raise exception 'Not enough stock: % on hand', coalesce(v_on_hand, 0);
+  end if;
+  return new;
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- D. DISPENSING AND REVERSING (the only ways to write to dispensings)
+-- ---------------------------------------------------------------------
+
+create or replace function dispense_prescription(
+  p_prescription_id uuid,
+  p_quantity integer,
+  p_is_partial boolean default false,
+  p_note text default null
+)
+returns uuid
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_rx record;
+  v_item uuid;
+  v_on_hand bigint;
+  v_id uuid;
+begin
+  if not has_permission('dispensing.manage') then
+    raise exception 'You do not have permission to dispense medicines';
+  end if;
+  if p_quantity is null or p_quantity <= 0 then
+    raise exception 'Enter a quantity above zero';
+  end if;
+
+  select p.id, p.medication_id, v.facility_id into v_rx
+    from prescriptions p join visits v on v.id = p.visit_id
+   where p.id = p_prescription_id and v.facility_id = my_facility_id()
+     for update of p;
+  if not found then
+    raise exception 'Prescription not found at your facility';
+  end if;
+
+  if exists (select 1 from dispensings
+              where prescription_id = p_prescription_id and is_partial = false and reversed_at is null) then
+    raise exception 'This prescription has already been dispensed';
+  end if;
+
+  select id into v_item from inventory_items
+   where facility_id = v_rx.facility_id and medication_id = v_rx.medication_id
+     for update;
+  if v_item is null then
+    raise exception 'This medicine is not in the stock list. Ask an administrator to add it under Inventory.';
+  end if;
+
+  v_on_hand := medicine_stock(v_rx.facility_id, v_rx.medication_id);
+  if v_on_hand < p_quantity then
+    raise exception 'Not enough stock: % on hand', v_on_hand;
+  end if;
+
+  insert into dispensings (prescription_id, quantity, is_partial, note, dispensed_by)
+  values (p_prescription_id, p_quantity, coalesce(p_is_partial, false), nullif(trim(coalesce(p_note, '')), ''), auth.uid())
+  returning id into v_id;
+
+  return v_id;
+end;
+$$;
+
+create or replace function reverse_dispensing(p_dispensing_id uuid, p_reason text)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_row record;
+begin
+  if not has_permission('dispensing.manage') then
+    raise exception 'You do not have permission to dispense medicines';
+  end if;
+  if coalesce(trim(p_reason), '') = '' then
+    raise exception 'Give a reason for reversing this dispensing';
+  end if;
+
+  select d.id, d.reversed_at into v_row
+    from dispensings d
+    join prescriptions p on p.id = d.prescription_id
+    join visits v on v.id = p.visit_id
+   where d.id = p_dispensing_id and v.facility_id = my_facility_id()
+     for update of d;
+  if not found then
+    raise exception 'Dispensing record not found at your facility';
+  end if;
+  if v_row.reversed_at is not null then
+    raise exception 'This dispensing has already been reversed';
+  end if;
+
+  update dispensings
+     set reversed_at = now(), reversed_by = auth.uid(), reversal_reason = trim(p_reason)
+   where id = p_dispensing_id;
+end;
+$$;
+
+-- ---------------------------------------------------------------------
+-- E. WHO CAN SEE WHAT
+-- ---------------------------------------------------------------------
+
+alter table dispensings enable row level security;
+
+-- clinical staff can see what has been dispensed for prescriptions at their facility
+drop policy if exists "staff read dispensings" on dispensings;
+create policy "staff read dispensings" on dispensings for select using (
+  exists (select 1 from prescriptions p join visits v on v.id = p.visit_id
+           where p.id = dispensings.prescription_id and v.facility_id = my_facility_id()));
+
+-- patients can see the status of their own medicines
+drop policy if exists "patient reads own dispensings" on dispensings;
+create policy "patient reads own dispensings" on dispensings for select using (
+  exists (select 1 from prescriptions p join visits v on v.id = p.visit_id
+           where p.id = dispensings.prescription_id and v.patient_id = my_patient_id()));
+-- (no insert/update/delete policies: writes happen only through the two functions above)
+
+-- Prescriptions waiting at the pharmacy, with how much has been given and stock on hand.
+-- security_invoker: the caller's own access rules apply, so it is limited to their facility.
+create or replace view pharmacy_queue with (security_invoker = on) as
+select
+  p.id as prescription_id,
+  p.created_at,
+  v.facility_id,
+  pt.id as patient_id,
+  pt.first_name,
+  pt.last_name,
+  pt.card_number,
+  m.id as medication_id,
+  m.name as medication_name,
+  m.form,
+  m.strength,
+  p.dosage,
+  p.frequency,
+  p.duration_days,
+  p.instructions,
+  case when s.id is null then null else s.first_name || ' ' || s.last_name end as prescribed_by_name,
+  coalesce(d.dispensed_quantity, 0) as dispensed_quantity,
+  case when coalesce(d.is_complete, false) then 'dispensed'
+       when coalesce(d.dispensed_quantity, 0) > 0 then 'partial'
+       else 'pending' end as status,
+  medicine_stock(v.facility_id, p.medication_id) as on_hand
+from prescriptions p
+join visits v on v.id = p.visit_id
+join patients pt on pt.id = v.patient_id
+join medications m on m.id = p.medication_id
+left join staff s on s.id = p.prescribed_by
+left join lateral (
+  select sum(x.quantity) as dispensed_quantity, bool_or(not x.is_partial) as is_complete
+    from dispensings x
+   where x.prescription_id = p.id and x.reversed_at is null
+) d on true;
+
+create or replace view dispensing_history with (security_invoker = on) as
+select
+  d.id as dispensing_id,
+  d.prescription_id,
+  d.dispensed_at,
+  d.quantity,
+  d.is_partial,
+  d.note,
+  d.reversed_at,
+  d.reversal_reason,
+  v.facility_id,
+  pt.first_name,
+  pt.last_name,
+  pt.card_number,
+  m.name as medication_name,
+  m.form,
+  m.strength,
+  p.dosage,
+  p.frequency,
+  case when sb.id is null then null else sb.first_name || ' ' || sb.last_name end as dispensed_by_name,
+  case when sr.id is null then null else sr.first_name || ' ' || sr.last_name end as reversed_by_name
+from dispensings d
+join prescriptions p on p.id = d.prescription_id
+join visits v on v.id = p.visit_id
+join patients pt on pt.id = v.patient_id
+join medications m on m.id = p.medication_id
+left join staff sb on sb.id = d.dispensed_by
+left join staff sr on sr.id = d.reversed_by;
+
+-- Medicine stock for the pharmacy (read-only). A plain view so a pharmacist can
+-- read it without access to the administrator-only inventory tables; it only
+-- ever returns the caller's own facility, and only to pharmacists and administrators.
+create or replace view pharmacy_stock as
+select
+  it.id as inventory_item_id,
+  m.id as medication_id,
+  m.name || ' (' || m.form || ', ' || m.strength || ')' as item_name,
+  it.unit,
+  it.reorder_level,
+  medicine_stock(it.facility_id, it.medication_id) as on_hand,
+  medicine_stock(it.facility_id, it.medication_id) <= it.reorder_level as is_low
+from inventory_items it
+join medications m on m.id = it.medication_id
+where it.facility_id = my_facility_id()
+  and (is_admin() or has_permission('dispensing.manage'));
+
+-- ---------------------------------------------------------------------
+-- F. FUNCTION PERMISSIONS AND AUDIT
+-- ---------------------------------------------------------------------
+
+do $$
+declare
+  r text;
+begin
+  revoke execute on function medicine_stock(uuid, integer) from public;
+  revoke execute on function dispense_prescription(uuid, integer, boolean, text) from public;
+  revoke execute on function reverse_dispensing(uuid, text) from public;
+  foreach r in array array['anon', 'authenticated'] loop
+    if exists (select 1 from pg_roles where rolname = r) then
+      execute format('revoke execute on function medicine_stock(uuid, integer) from %I', r);
+      execute format('revoke execute on function dispense_prescription(uuid, integer, boolean, text) from %I', r);
+      execute format('revoke execute on function reverse_dispensing(uuid, text) from %I', r);
+    end if;
+  end loop;
+  foreach r in array array['authenticated'] loop
+    if exists (select 1 from pg_roles where rolname = r) then
+      execute format('grant execute on function medicine_stock(uuid, integer) to %I', r);
+      execute format('grant execute on function dispense_prescription(uuid, integer, boolean, text) to %I', r);
+      execute format('grant execute on function reverse_dispensing(uuid, text) to %I', r);
+    end if;
+  end loop;
+  if exists (select 1 from pg_roles where rolname = 'anon') then
+    revoke all on pharmacy_stock from anon;
+  end if;
+end $$;
+
+drop trigger if exists audit_dispensings on dispensings;
+create trigger audit_dispensings after insert or update on dispensings
+  for each row execute function log_audit_event();
+

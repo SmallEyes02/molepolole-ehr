@@ -44,12 +44,17 @@ export default function Privacy() {
           </section>
 
           <section>
-            <h2 className="mb-1 font-semibold text-ink">7. Patient rights</h2>
+            <h2 className="mb-1 font-semibold text-ink">7. Patient portal</h2>
+            <p>Patients may be given online access to their own record, limited to their visits, measurements, diagnoses, prescribed medicines and appointments. Access is granted only after the facility has confirmed the patient's identity in person and issued a one-time activation code. A patient can see only their own information and cannot see any other patient's. Portal access does not expire: it stays in place until the patient asks the facility to remove it, or the facility withdraws it (for example if a phone is lost). Each patient also has a card number, which helps staff find a record but does not on its own give anyone access to it. Appointment notifications are shown inside the portal; the portal does not currently send texts or emails.</p>
+          </section>
+
+          <section>
+            <h2 className="mb-1 font-semibold text-ink">8. Patient rights</h2>
             <p>Patients, or their legal guardian, may request a copy of their held information or request correction of inaccurate details by making a request to the facility where they are registered.</p>
           </section>
 
           <section>
-            <h2 className="mb-1 font-semibold text-ink">8. Contact</h2>
+            <h2 className="mb-1 font-semibold text-ink">9. Contact</h2>
             <p>Questions about this policy should be directed to your facility's system administrator or data protection point of contact.</p>
           </section>
         </div>
