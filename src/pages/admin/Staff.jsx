@@ -84,21 +84,50 @@ export default function Staff() {
     load()
   }
 
-  async function createStaff(e) {
-    e.preventDefault()
-    setMessage(null)
-    setBusy(true)
-    if (addMode === 'link') return linkStaff()
-    const { error } = await supabase.functions.invoke('manage-staff', {
-      body: { action: 'create', ...form, role_id: Number(form.role_id), department_id: form.department_id || null }
-    })
-    setBusy(false)
-    if (error) return fail(await functionError(error))
-    ok(`Account created for ${form.first_name} ${form.last_name}. Give them the temporary password securely.`)
-    setForm(blankNew)
-    setShowAdd(false)
-    load()
+
+async function createStaff(e) {
+  e.preventDefault();
+  setMessage(null);
+  setBusy(true);
+
+  try {
+    if (addMode === "link") {
+      await linkStaff();
+      return;
+    }
+
+    const { error } = await supabase.functions.invoke("manage-staff", {
+      body: {
+        action: "create",
+        ...form,
+        role_id: Number(form.role_id),
+        department_id: form.department_id || null,
+      },
+    });
+
+    if (error) {
+      return fail(await functionError(error));
+    }
+
+    ok(
+      `Account created for ${form.first_name} ${form.last_name}. Give them the temporary password securely.`,
+    );
+
+    setForm(blankNew);
+    setShowAdd(false);
+
+    await load();
+  } catch (error) {
+    fail(
+      error instanceof Error
+        ? error.message
+        : "Unable to create staff account.",
+    );
+  } finally {
+    setBusy(false);
   }
+}
+
 
   async function saveEdit() {
     const d = editing.draft
