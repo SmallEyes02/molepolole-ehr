@@ -25,25 +25,76 @@ export default function NewPatient() {
   async function handleSubmit(e) {
     e.preventDefault()
     setError('')
-    setSubmitting(true)
 
-    const { data, error } = await supabase
-      .from('patients')
-      .insert({
-        ...form,
-        omang_number: form.omang_number || null,
-        village_id: village?.id || null,
-        registered_facility_id: profile.facility_id
-      })
-      .select('id')
-      .single()
+    const firstName = form.first_name.trim()
+    const lastName = form.last_name.trim()
+    const identityNumber = form.omang_number.trim()
 
-    setSubmitting(false)
-    if (error) {
-      setError(error.message)
+    if (!firstName || !lastName) {
+      setError('Enter the patient’s first name and last name.')
       return
     }
-    navigate(`/patients/${data.id}`)
+
+    if (!/^[0-9]{9}$/.test(identityNumber)) {
+      setError('Omang ID or birth certificate number must contain exactly 9 digits.')
+      return
+    }
+
+    if (!form.date_of_birth) {
+      setError('Enter the patient’s date of birth.')
+      return
+    }
+
+    if (!profile?.facility_id) {
+      setError('Your facility could not be verified. Sign in again or contact the system administrator.')
+      return
+    }
+
+    setSubmitting(true)
+    try {
+      const { data, error: insertError } = await supabase
+        .from('patients')
+        .insert({
+          ...form,
+          first_name: firstName,
+          last_name: lastName,
+          omang_number: identityNumber,
+          village_id: village?.id || null,
+          registered_facility_id: profile.facility_id
+        })
+        .select('id')
+        .single()
+
+      if (insertError) {
+        console.error('Patient registration failed:', insertError)
+        if (insertError.code === '23505') {
+          setError('A patient with this Omang ID or birth certificate number may already be registered. Check the number and search existing patient records before trying again.')
+        } else if (insertError.code === '23502') {
+          setError('A required patient detail is missing. Check the form and try again.')
+        } else if (insertError.code === '23503') {
+          setError('The selected village or facility is no longer valid. Refresh the page, select the village again, and retry.')
+        } else if (insertError.code === '42501') {
+          setError('You do not have permission to register patients at this facility. Contact the system administrator if you believe this is a mistake.')
+        } else if (insertError.code === '22P02') {
+          setError('One of the entered details has an invalid format. Check the form and try again.')
+        } else {
+          setError('The patient could not be registered due to a system error. Please try again. If the problem continues, contact the system administrator.')
+        }
+        return
+      }
+
+      if (!data?.id) {
+        setError('The patient record may not have been confirmed. Search for the patient before attempting to register them again.')
+        return
+      }
+
+      navigate(`/patients/${data.id}`)
+    } catch (err) {
+      console.error('Unexpected patient registration error:', err)
+      setError('Unable to connect to the registration service. Check your internet connection and try again.')
+    } finally {
+      setSubmitting(false)
+    }
   }
 
   return (
@@ -71,8 +122,21 @@ export default function NewPatient() {
 
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className="label">Omang number</label>
-              <input className="input" value={form.omang_number} onChange={(e) => update('omang_number', e.target.value)} placeholder="Optional" />
+              <label className="label">Omang ID</label>
+              <input
+                required
+                aria-invalid={Boolean(error && !/^[0-9]{9}$/.test(form.omang_number.trim()))}
+                className="input"
+                type="text"
+                inputMode="numeric"
+                pattern="[0-9]{9}"
+                minLength={9}
+                maxLength={9}
+                title="Enter exactly 9 digits. Use the Omang ID or birth certificate number."
+                value={form.omang_number}
+                onChange={(e) => update('omang_number', e.target.value.replace(/\D/g, '').slice(0, 9))}
+                placeholder="Exactly 9 digits"
+              />
             </div>
             <div>
               <label className="label">Sex</label>
@@ -101,7 +165,7 @@ export default function NewPatient() {
 
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className="label">Next of kin name</label>
+              <label className="label">Next of kin full name</label>
               <input className="input" value={form.next_of_kin_name} onChange={(e) => update('next_of_kin_name', e.target.value)} />
             </div>
             <div>
